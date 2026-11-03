@@ -1616,11 +1616,13 @@ static const struct dma_buf_mapping_pal_exp_ops nv_dma_buf_pal_ops = {
 };
 
 //
-// Offer PAL where the ranges are MMIO from the host's point of view (a
-// discrete GPU, or FORCE_PCIE which selects the BAR1 PFNs on coherent
-// platforms), then the SGT type for every other importer. The SGT match
-// is the plain one, not the P2P one, so that importers without a PCI
-// device (a misc device importer) keep working as before this series.
+// Offer PAL only for a discrete GPU, where the ranges are BAR1 MMIO and an
+// IOMMU mapping of them is what the importer builds. FORCE_PCIE on coherent
+// platforms also uses BAR1 PFNs, but the SGT path checks the topology and
+// then bypasses the IOMMU there (skip_iommu), and PAL can do neither, so it
+// is left out until it can be tested. The SGT match is the plain one, not
+// the P2P one, so that importers without a PCI device (a misc device
+// importer) keep working as before this series.
 //
 static int
 nv_dma_buf_match_mapping(
@@ -1633,8 +1635,7 @@ nv_dma_buf_match_mapping(
     struct device *dev;
     int rc;
 
-    if (!priv->nv->coherent ||
-        (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_FORCE_PCIE))
+    if (!priv->nv->coherent)
     {
         matches[num_match++] = DMA_BUF_EMAPPING_PAL(&nv_dma_buf_pal_ops);
     }
