@@ -1521,9 +1521,12 @@ nv_dma_buf_get_bar1_ranges(
         goto unlock_priv;
     }
 
-    // Coherent platforms in DEFAULT mode share struct pages, not BAR1.
-    if (priv->nv->coherent &&
-        (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_DEFAULT))
+    //
+    // Discrete GPUs only. Coherent platforms share struct pages in DEFAULT
+    // mode, and with FORCE_PCIE the driver bypasses the IOMMU for P2P
+    // there, which an IOMMU mapping of these ranges would not match.
+    //
+    if (priv->nv->coherent)
     {
         rc = -EOPNOTSUPP;
         goto unlock_priv;
