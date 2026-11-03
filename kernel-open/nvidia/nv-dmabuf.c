@@ -22,6 +22,9 @@
  */
 #include <linux/dma-buf.h>
 #include "nv-dmabuf.h"
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+#include <linux/dma-buf-mapping.h>
+#endif
 
 #if defined(CONFIG_DMA_SHARED_BUFFER)
 
@@ -1004,6 +1007,65 @@ free_sgt:
     return NULL;
 }
 
+//
+// Check the importing device against the GPU's PCI topology and record
+// whether the IOMMU is to be skipped. Called with priv->lock held.
+// A non-PCI importer (for example a misc device) has no topology to check.
+//
+static int
+nv_dma_buf_check_peer_device(
+    nv_dma_buf_file_private_t *priv,
+    struct device *dev
+)
+{
+    if (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_FORCE_PCIE)
+    {
+        if (dev_is_pci(dev) &&
+            !nv_pci_is_valid_topology_for_direct_pci(priv->nv, to_pci_dev(dev)))
+        {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: dma-buf attach failed: "
+                      "topology not supported for mapping type FORCE_PCIE\n");
+            return -ENOTSUPP;
+        }
+
+        priv->skip_iommu = NV_TRUE;
+    }
+    else if (dev_is_pci(dev))
+    {
+        nv_dma_device_t peer_dma_dev = {{ 0 }};
+
+        peer_dma_dev.dev = &to_pci_dev(dev)->dev;
+        peer_dma_dev.addressable_range.limit = to_pci_dev(dev)->dma_mask;
+
+        if (!nv_grdma_pci_topology_supported(priv->nv, &peer_dma_dev))
+        {
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: dma-buf attach failed: "
+                      "PCI topology not supported for dma-buf\n");
+            return -ENOTSUPP;
+        }
+    }
+
+    return 0;
+}
+
+//
+// The device the SGT mapping is made for. With mapping types the
+// attachment no longer carries it and the SGT type supplies it.
+//
+static struct device*
+nv_dma_buf_attachment_dev(
+    struct dma_buf_attachment *attachment
+)
+{
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    return dma_buf_sgt_dma_device(attachment);
+#else
+    return attachment->dev;
+#endif
+}
+
 static int
 nv_dma_buf_attach(
     struct dma_buf *buf,
@@ -1018,36 +1080,17 @@ nv_dma_buf_attach(
 
     mutex_lock(&priv->lock);
 
-    if (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_FORCE_PCIE)
+#if !defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    //
+    // With mapping types the importing device is only known once the
+    // mapping type is matched, so the check moves to match_mapping.
+    //
+    rc = nv_dma_buf_check_peer_device(priv, attachment->dev);
+    if (rc != 0)
     {
-        if(!nv_pci_is_valid_topology_for_direct_pci(priv->nv,
-                                                    to_pci_dev(attachment->dev)))
-        {
-            nv_printf(NV_DBG_ERRORS,
-                      "NVRM: dma-buf attach failed: "
-                      "topology not supported for mapping type FORCE_PCIE\n");
-            rc = -ENOTSUPP;
-            goto unlock_priv;
-        }
-
-        priv->skip_iommu = NV_TRUE;
+        goto unlock_priv;
     }
-    else
-    {
-        nv_dma_device_t peer_dma_dev = {{ 0 }};
-
-        peer_dma_dev.dev = &to_pci_dev(attachment->dev)->dev;
-        peer_dma_dev.addressable_range.limit = to_pci_dev(attachment->dev)->dma_mask;
-
-        if (!nv_grdma_pci_topology_supported(priv->nv, &peer_dma_dev))
-        {
-            nv_printf(NV_DBG_ERRORS,
-                      "NVRM: dma-buf attach failed: "
-                      "PCI topology not supported for dma-buf\n");
-            rc = -ENOTSUPP;
-            goto unlock_priv;
-        }
-    }
+#endif
 
 #if defined(NV_DMA_BUF_ATTACHMENT_HAS_PEER2PEER)
     if ((attachment->importer_ops != NULL) &&
@@ -1062,7 +1105,7 @@ nv_dma_buf_attach(
     }
 #endif
 
-unlock_priv:
+unlock_priv: __attribute__((unused));
     mutex_unlock(&priv->lock);
 
     return rc;
@@ -1078,6 +1121,12 @@ nv_dma_buf_map(
     struct sg_table *sgt = NULL;
     struct dma_buf *buf = attachment->dmabuf;
     nv_dma_buf_file_private_t *priv = buf->priv;
+    struct device *dev = nv_dma_buf_attachment_dev(attachment);
+
+    if (dev == NULL)
+    {
+        return NULL;
+    }
 
     mutex_lock(&priv->lock);
 
@@ -1108,11 +1157,11 @@ nv_dma_buf_map(
     if (priv->nv->coherent &&
         (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_DEFAULT))
     {
-        sgt = nv_dma_buf_map_pages(attachment->dev, priv);
+        sgt = nv_dma_buf_map_pages(dev, priv);
     }
     else
     {
-        sgt = nv_dma_buf_map_pfns(attachment->dev, priv);
+        sgt = nv_dma_buf_map_pfns(dev, priv);
     }
     if (sgt == NULL)
     {
@@ -1144,17 +1193,18 @@ nv_dma_buf_unmap(
 {
     struct dma_buf *buf = attachment->dmabuf;
     nv_dma_buf_file_private_t *priv = buf->priv;
+    struct device *dev = nv_dma_buf_attachment_dev(attachment);
 
     mutex_lock(&priv->lock);
 
     if (priv->nv->coherent &&
         (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_DEFAULT))
     {
-        nv_dma_buf_unmap_pages(attachment->dev, sgt, priv);
+        nv_dma_buf_unmap_pages(dev, sgt, priv);
     }
     else
     {
-        nv_dma_buf_unmap_pfns(attachment->dev, sgt, priv);
+        nv_dma_buf_unmap_pfns(dev, sgt, priv);
     }
 
     //
@@ -1457,10 +1507,168 @@ nv_dma_buf_unmap_atomic_stub(
 // The actual implementations of these interfaces is not really required
 // for the export operation to work.
 //
-static const struct dma_buf_ops nv_dma_buf_ops = {
-    .attach        = nv_dma_buf_attach,
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+static const struct dma_buf_mapping_sgt_exp_ops nv_dma_buf_sgt_ops = {
     .map_dma_buf   = nv_dma_buf_map,
     .unmap_dma_buf = nv_dma_buf_unmap,
+};
+
+//
+// Physical Address List (PAL) exporter. The importer (iommufd) receives
+// the memory ranges RM reports for the handles, which for a discrete GPU
+// are BAR1 PCIe addresses, and builds its own IOMMU mapping from them.
+// Ranges are not split by any DMA segment limit because no DMA mapping is
+// made here. The list stays valid until unmap_phys: the phys address
+// refcount holds the RM ranges for that long, as it does for an SGT map.
+//
+static struct dma_buf_phys_list*
+nv_dma_buf_pal_map_phys(
+    struct dma_buf_attachment *attachment
+)
+{
+    NV_STATUS status;
+    nv_dma_buf_file_private_t *priv = attachment->dmabuf->priv;
+    struct dma_buf_phys_list *phys = NULL;
+    NvU32 nranges = 0;
+    NvU32 n = 0;
+    NvU32 i, index;
+
+    mutex_lock(&priv->lock);
+
+    if (priv->num_objects != priv->total_objects)
+    {
+        phys = ERR_PTR(-EINVAL);
+        goto unlock_priv;
+    }
+
+    if (!priv->static_phys_addrs)
+    {
+        status = nv_dma_buf_get_phys_addresses(priv, 0, priv->num_objects);
+        if (status != NV_OK)
+        {
+            phys = ERR_PTR(-EIO);
+            goto unlock_priv;
+        }
+    }
+
+    for (i = 0; i < priv->num_objects; i++)
+    {
+        nranges += priv->handles[i].memArea.numRanges;
+    }
+
+    phys = kvmalloc(struct_size(phys, phys, nranges), GFP_KERNEL);
+    if (phys == NULL)
+    {
+        phys = ERR_PTR(-ENOMEM);
+        goto put_handles;
+    }
+
+    phys->length = nranges;
+    for (i = 0; i < priv->num_objects; i++)
+    {
+        for (index = 0; index < priv->handles[i].memArea.numRanges; index++)
+        {
+            phys->phys[n].paddr = priv->handles[i].memArea.pRanges[index].start;
+            phys->phys[n].len   = priv->handles[i].memArea.pRanges[index].size;
+            n++;
+        }
+    }
+
+    mutex_unlock(&priv->lock);
+
+    return phys;
+
+put_handles:
+    if (!priv->static_phys_addrs)
+    {
+        nv_dma_buf_put_phys_addresses(priv, 0, priv->num_objects);
+    }
+
+unlock_priv:
+    mutex_unlock(&priv->lock);
+
+    return phys;
+}
+
+static void
+nv_dma_buf_pal_unmap_phys(
+    struct dma_buf_attachment *attachment,
+    struct dma_buf_phys_list *phys
+)
+{
+    nv_dma_buf_file_private_t *priv = attachment->dmabuf->priv;
+
+    mutex_lock(&priv->lock);
+
+    kvfree(phys);
+
+    if (!priv->static_phys_addrs)
+    {
+        nv_dma_buf_put_phys_addresses(priv, 0, priv->num_objects);
+    }
+
+    mutex_unlock(&priv->lock);
+}
+
+static const struct dma_buf_mapping_pal_exp_ops nv_dma_buf_pal_ops = {
+    .map_phys   = nv_dma_buf_pal_map_phys,
+    .unmap_phys = nv_dma_buf_pal_unmap_phys,
+};
+
+//
+// Offer PAL where the ranges are MMIO from the host's point of view (a
+// discrete GPU, or FORCE_PCIE which selects the BAR1 PFNs on coherent
+// platforms), then the SGT type for every other importer. The SGT match
+// is the plain one, not the P2P one, so that importers without a PCI
+// device (a misc device importer) keep working as before this series.
+//
+static int
+nv_dma_buf_match_mapping(
+    struct dma_buf_match_args *args
+)
+{
+    nv_dma_buf_file_private_t *priv = args->dmabuf->priv;
+    struct dma_buf_mapping_match matches[2];
+    unsigned int num_match = 0;
+    struct device *dev;
+    int rc;
+
+    if (!priv->nv->coherent ||
+        (priv->mapping_type == NV_DMABUF_EXPORT_MAPPING_TYPE_FORCE_PCIE))
+    {
+        matches[num_match++] = DMA_BUF_EMAPPING_PAL(&nv_dma_buf_pal_ops);
+    }
+    matches[num_match++] = DMA_BUF_EMAPPING_SGT(&nv_dma_buf_sgt_ops);
+
+    rc = dma_buf_match_mapping(args, matches, num_match);
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    // PAL has no importing device and nothing to check.
+    dev = dma_buf_sgt_dma_device(args->attach);
+    if (dev == NULL)
+    {
+        return 0;
+    }
+
+    mutex_lock(&priv->lock);
+    rc = nv_dma_buf_check_peer_device(priv, dev);
+    mutex_unlock(&priv->lock);
+
+    return rc;
+}
+#endif // NV_DMA_BUF_OPS_HAS_MATCH_MAPPING
+
+static const struct dma_buf_ops nv_dma_buf_ops = {
+    .attach        = nv_dma_buf_attach,
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    .match_mapping = nv_dma_buf_match_mapping,
+#else
+    .map_dma_buf   = nv_dma_buf_map,
+    .unmap_dma_buf = nv_dma_buf_unmap,
+#endif
     .release       = nv_dma_buf_release,
     .mmap          = nv_dma_buf_mmap,
 #if defined(NV_DMA_BUF_OPS_HAS_MAP)
@@ -1818,7 +2026,11 @@ NV_STATUS NV_API_CALL nv_dma_import_dma_buf
 
     get_dma_buf(dma_buf);
 
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    dma_attach = dma_buf_sgt_attach(dma_buf, dma_dev->dev);
+#else
     dma_attach = dma_buf_attach(dma_buf, dma_dev->dev);
+#endif
     if (IS_ERR_OR_NULL(dma_attach))
     {
         nv_printf(NV_DBG_ERRORS, "Can't attach dma_buf!\n");
@@ -1839,7 +2051,11 @@ NV_STATUS NV_API_CALL nv_dma_import_dma_buf
         nv_dma_buf->direction = DMA_BIDIRECTIONAL;
     }
 
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    map_sgt = dma_buf_sgt_map_attachment(dma_attach, nv_dma_buf->direction);
+#else
     map_sgt = dma_buf_map_attachment(dma_attach, nv_dma_buf->direction);
+#endif
     if (IS_ERR_OR_NULL(map_sgt))
     {
         nv_printf(NV_DBG_ERRORS, "Can't map dma attachment!\n");
@@ -1915,8 +2131,13 @@ void NV_API_CALL nv_dma_release_dma_buf
     }
 
     nv_dma_buf = (nv_dma_buf_t *)import_priv;
+#if defined(NV_DMA_BUF_OPS_HAS_MATCH_MAPPING)
+    dma_buf_sgt_unmap_attachment(nv_dma_buf->dma_attach, nv_dma_buf->sgt,
+                                 nv_dma_buf->direction);
+#else
     dma_buf_unmap_attachment(nv_dma_buf->dma_attach, nv_dma_buf->sgt,
                              nv_dma_buf->direction);
+#endif
     dma_buf_detach(nv_dma_buf->dma_buf, nv_dma_buf->dma_attach);
     dma_buf_put(nv_dma_buf->dma_buf);
 

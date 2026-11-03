@@ -149,6 +149,7 @@ NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_map_ops_has_map_phys
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_map
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_map_atomic
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_attachment_has_peer2peer
+NV_CONFTEST_FUNCTION_COMPILE_TESTS += dma_buf_ops_has_match_mapping
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += devm_clk_bulk_get_all
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += get_task_ioprio
 NV_CONFTEST_FUNCTION_COMPILE_TESTS += mdev_set_iommu_device
