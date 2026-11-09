@@ -2454,6 +2454,34 @@ compile_test() {
             fi
         ;;
 
+        dma_buf_ops_has_match_mapping)
+            #
+            # Determine if struct dma_buf_ops has match_mapping. The DMA-buf
+            # mapping types series adds it together with
+            # <linux/dma-buf-mapping.h>. On such kernels map_dma_buf and
+            # unmap_dma_buf live in struct dma_buf_mapping_sgt_exp_ops,
+            # struct dma_buf_attachment has no dev member, and the importer
+            # entry points are named dma_buf_sgt_*().
+            #
+            echo "$CONFTEST_PREAMBLE
+            #include <linux/dma-buf.h>
+            int conftest_dma_buf_ops_has_match_mapping(void) {
+                return offsetof(struct dma_buf_ops, match_mapping);
+            }" > conftest$$.c
+
+            $CC $CFLAGS -c conftest$$.c > /dev/null 2>&1
+            rm -f conftest$$.c
+
+            if [ -f conftest$$.o ]; then
+                echo "#define NV_DMA_BUF_OPS_HAS_MATCH_MAPPING" | append_conftest "types"
+                rm -f conftest$$.o
+                return
+            else
+                echo "#undef NV_DMA_BUF_OPS_HAS_MATCH_MAPPING" | append_conftest "types"
+                return
+            fi
+        ;;
+
         drm_fb_create_takes_format_info)
             #
             # Determine if a `struct drm_format_info *` is passed into
